@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+.Python
+venv/
+env/
+ENV/
+
+# Taichi
+*.tc
+*.tcm
+.taichi/
+
+# CMake and C++ build artifacts
+geom_bridge/build/
+geom_bridge/*.so
+geom_bridge/*.dylib
+geom_bridge/geom_bridge.cpython-*.so
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Geogram vendor build (keep source, ignore build artifacts)
+geom_bridge/geogram_vendor/build/
+geom_bridge/geogram_vendor/doc/html/
+geom_bridge/geogram_vendor/doc/devkit/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs and debug
+*.log
+core.*
+vgcore.*
+
+# Test outputs
+test_output/
+*.profraw
+*.profdata
+
+# Backup files
+*_backup.cpp
+*_original.cpp
+*.bak
+

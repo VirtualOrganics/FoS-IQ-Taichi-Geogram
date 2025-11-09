@@ -1,0 +1,15 @@
+# FoS-IQ-Taichi-Geogram Python Dependencies
+
+# Core framework for GPU-accelerated dynamics and visualization
+taichi>=1.7.0
+
+# Numerical computing and array operations
+numpy>=1.24.0
+
+# Python/C++ binding for Geogram bridge
+pybind11>=2.11.0
+
+# Optional: for profiling and debugging
+# psutil>=5.9.0
+# memory_profiler>=0.60.0
+

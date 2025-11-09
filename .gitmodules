@@ -1,0 +1,3 @@
+[submodule "geom_bridge/geogram_vendor"]
+	path = geom_bridge/geogram_vendor
+	url = https://github.com/BrunoLevy/geogram.git
