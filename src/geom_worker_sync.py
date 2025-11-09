@@ -33,11 +33,9 @@ class GeomWorkerSync:
         
         if N <= max_chunk:
             # Single call - arrays already contiguous from above
-            res = compute_power_cells(pts01, w, periodic=True)
-            return (np.asarray(res.volume, dtype=np.float64),
-                    np.asarray(res.area, dtype=np.float64),
-                    np.asarray(res.fsc, dtype=np.int32),
-                    np.asarray(res.flags, dtype=np.int32))
+            # New binding returns tuple (V, A, FSC, flags) directly
+            V, A, FSC, flags = compute_power_cells(pts01, w)
+            return (V, A, FSC, flags)
         
         # Chunked path
         vols, areas, fscs, flags_list = [], [], [], []
@@ -49,12 +47,13 @@ class GeomWorkerSync:
             pts_chunk = np.ascontiguousarray(pts01[i:j].copy(), dtype=np.float64)
             w_chunk = np.ascontiguousarray(w[i:j].copy(), dtype=np.float64)
             
-            res = compute_power_cells(pts_chunk, w_chunk, periodic=True)
+            # New binding returns tuple directly
+            V, A, FSC, flags_chunk = compute_power_cells(pts_chunk, w_chunk)
             
-            vols.append(np.asarray(res.volume, dtype=np.float64))
-            areas.append(np.asarray(res.area, dtype=np.float64))
-            fscs.append(np.asarray(res.fsc, dtype=np.int32))
-            flags_list.append(np.asarray(res.flags, dtype=np.int32))
+            vols.append(V)
+            areas.append(A)
+            fscs.append(FSC)
+            flags_list.append(flags_chunk)
         
         return (np.concatenate(vols), np.concatenate(areas),
                 np.concatenate(fscs), np.concatenate(flags_list))

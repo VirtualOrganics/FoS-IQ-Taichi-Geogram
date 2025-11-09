@@ -1,5 +1,5 @@
-// bridge_hardened.cpp — MAXIMUM DEFENSIVE VERSION
-// Bullet-proof pybind11 → Geogram bridge with full memory safety
+// bridge.cpp — pybind11 → Geogram with OWNED COPIES + GIL RELEASE
+// Fixes memory lifetime issues that cause crashes at 1500+ frames
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -8,7 +8,6 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
-#include <algorithm>
 
 // Geogram headers
 #include <geogram/basic/common.h>
@@ -26,214 +25,170 @@ struct GeometryResult {
     std::vector<int>    flags;
 };
 
-// HARDENED implementation with full memory ownership and validation
-GeometryResult compute_power_cells_hardened(
-    py::array_t<double, py::array::c_style | py::array::forcecast> points_norm,
-    py::array_t<double, py::array::c_style | py::array::forcecast> weights
+// Core computation: Takes OWNED std::vectors, returns result
+// This runs with GIL released - no Python interaction during Geogram calls
+static GeometryResult compute_power_cells_periodic_vec(
+    const std::vector<double>& P,  // size 3*N (flat: x0,y0,z0, x1,y1,z1, ...)
+    const std::vector<double>& W   // size N (weights = r^2)
 ) {
-    // 1) VALIDATE input buffers
-    auto bufP = points_norm.request();
-    auto bufW = weights.request();
-    
-    if (bufP.ndim != 2 || bufP.shape[1] != 3) {
-        throw std::runtime_error("points_norm must be Nx3");
-    }
-    if (bufW.ndim != 1) {
-        throw std::runtime_error("weights must be 1D");
-    }
-    
-    const size_t N = static_cast<size_t>(bufW.shape[0]);
-    if (bufP.shape[0] != static_cast<ssize_t>(N)) {
-        throw std::runtime_error("points and weights size mismatch");
-    }
-    
-    if (N == 0 || N > 100000) {
-        throw std::runtime_error("N out of reasonable range");
-    }
-    
-    // 2) COPY into C++-owned memory (NO aliasing, NO dangling views)
-    std::vector<double> P(N * 3);
-    std::vector<double> W(N);
-    
-    std::memcpy(P.data(), bufP.ptr, sizeof(double) * P.size());
-    std::memcpy(W.data(), bufW.ptr, sizeof(double) * W.size());
-    
-    // 3) SANITIZE inputs
-    for (size_t i = 0; i < N * 3; ++i) {
-        if (!std::isfinite(P[i])) {
-            throw std::runtime_error("NaN/Inf in positions");
-        }
-        // Wrap to [0, 1)
-        while (P[i] < 0.0) P[i] += 1.0;
-        while (P[i] >= 1.0) P[i] -= 1.0;
-        P[i] = std::max(0.0, std::min(0.999999, P[i]));
-    }
-    
-    for (size_t i = 0; i < N; ++i) {
-        if (!std::isfinite(W[i]) || W[i] < 0.0) {
-            W[i] = 1e-6;  // Safe fallback
-        }
-        W[i] = std::max(1e-6, std::min(1.0, W[i]));
-    }
-    
-    // 4) Initialize result
     GeometryResult out;
+    const size_t N = W.size();
     out.volume.resize(N, 0.0);
     out.area.resize(N, 0.0);
     out.fsc.resize(N, 0);
     out.flags.resize(N, 0);
-    
-    // 5) Initialize Geogram (safe to call repeatedly)
+
+    // Initialize Geogram once per process
     static bool geo_inited = false;
     if (!geo_inited) {
         GEO::initialize();
         GEO::Logger::instance()->set_quiet(true);
         geo_inited = true;
     }
-    
-    // 6) Build FRESH PeriodicDelaunay3d (stack object, no reuse)
-    GEO::PeriodicDelaunay3d pd(/*periodic=*/true, /*period=*/1.0);
-    
-    try {
-        pd.set_vertices(GEO::index_t(N), P.data());
-        pd.set_weights(W.data());
-        pd.compute();
-    } catch (const std::exception& e) {
-        // Geogram itself failed - mark all as degenerate
-        for (size_t i = 0; i < N; ++i) {
-            out.flags[i] = 9;  // Triangulation failed
-        }
-        return out;
-    }
-    
-    // 7) FRESH workspace per call (no static reuse)
+
+    // Bruno's required pattern: SmartPointer<PeriodicDelaunay3d>
+    GEO::SmartPointer<GEO::PeriodicDelaunay3d> pd =
+        new GEO::PeriodicDelaunay3d(/*periodic=*/true, /*period=*/1.0);
+
+    pd->set_vertices(GEO::index_t(N), P.data());
+    pd->set_weights(W.data());
+    pd->compute();
+
+    // Workspace for cell extraction
     VBW::ConvexCell cell;
     cell.use_exact_predicates(true);
-    GEO::PeriodicDelaunay3d::IncidentTetrahedra W_workspace;
-    
-    // 8) Extract each cell with MAXIMUM defensive coding
+    GEO::PeriodicDelaunay3d::IncidentTetrahedra wk;
+
+    // Extract each Laguerre cell
     for (GEO::index_t v = 0; v < GEO::index_t(N); ++v) {
         try {
             cell.clear();
+            pd->copy_Laguerre_cell_from_Delaunay(v, cell, wk);
             
-            // Copy Laguerre cell
-            try {
-                pd.copy_Laguerre_cell_from_Delaunay(v, cell, W_workspace);
-            } catch (...) {
-                out.flags[v] = 2;  // Cell extraction failed
+            if (cell.empty()) {
+                out.flags[v] = 1; // Mark empty/degenerate
                 continue;
             }
             
-            // CRITICAL: Compute geometry before ANY queries
-            try {
-                cell.compute_geometry();
-            } catch (...) {
-                out.flags[v] = 3;  // Geometry computation failed
-                continue;
+            cell.compute_geometry();
+            
+            // Volume
+            double V = cell.volume();
+            if (!std::isfinite(V) || V < 0.0) {
+                out.flags[v] = 2;
+                V = 0.0;
             }
-            
-            // Check if empty
-            if (cell.empty() || cell.nb_v() == 0) {
-                out.flags[v] = 1;  // Empty cell
-                continue;
-            }
-            
-            // Compute volume (with guard)
-            double V = 0.0;
-            try {
-                V = cell.volume();
-                if (!std::isfinite(V) || V < 0.0) {
-                    V = 0.0;
-                    out.flags[v] = 4;  // Invalid volume
-                }
-            } catch (...) {
-                out.flags[v] = 5;  // Volume computation crashed
-                continue;
-            }
-            
-            // Compute surface area and face count (with guards)
-            double S = 0.0;
-            int FSC = 0;
-            
-            try {
-                const GEO::index_t nv = cell.nb_v();
-                
-                for (GEO::index_t lv = 0; lv < nv; ++lv) {
-                    // Skip non-contributing vertices
-                    bool contributing = false;
-                    try {
-                        contributing = cell.vertex_is_contributing(lv);
-                    } catch (...) {
-                        continue;  // Skip problematic vertex
-                    }
-                    
-                    if (!contributing) continue;
-                    
-                    ++FSC;
-                    
-                    // Get facet area with guard
-                    try {
-                        double area = cell.facet_area(lv);
-                        if (std::isfinite(area) && area >= 0.0) {
-                            S += area;
-                        }
-                    } catch (...) {
-                        // Facet area failed, skip this facet
-                        --FSC;  // Don't count it
-                    }
-                }
-            } catch (...) {
-                out.flags[v] = 6;  // Facet iteration failed
-                // Keep V, set S=0, FSC=0
-            }
-            
-            // Sanity checks
-            if (V > 1.0) V = 1.0;  // Can't be larger than unit cube
-            if (S > 6.0) S = 6.0;  // Can't be larger than cube surface
-            if (FSC > 100) FSC = 100;  // Reasonable upper bound
-            
             out.volume[v] = V;
+            
+            // Surface area and face count
+            double S = 0.0;
+            int F = 0;
+            const GEO::index_t nv = cell.nb_v();
+            for (GEO::index_t lv = 0; lv < nv; ++lv) {
+                if (!cell.vertex_is_contributing(lv)) continue;
+                ++F;
+                double a = cell.facet_area(lv);
+                if (a > 0.0) S += a;
+            }
             out.area[v] = S;
-            out.fsc[v] = FSC;
+            out.fsc[v] = F;
             
         } catch (const std::exception& e) {
-            // Catch-all for this cell
-            out.flags[v] = 7;
-            out.volume[v] = 0.0;
-            out.area[v] = 0.0;
-            out.fsc[v] = 0;
-        } catch (...) {
-            // Unknown exception
-            out.flags[v] = 8;
+            out.flags[v] = 3; // Exception during extraction
             out.volume[v] = 0.0;
             out.area[v] = 0.0;
             out.fsc[v] = 0;
         }
     }
-    
+
     return out;
 }
 
-// Python module binding
+// Python module binding with PROPER MEMORY MANAGEMENT
 PYBIND11_MODULE(geom_bridge, m) {
-    m.doc() = "Geogram bridge - HARDENED VERSION with maximum defensive coding";
-    
-    py::class_<GeometryResult>(m, "GeometryResult")
-        .def(py::init<>())
-        .def_readwrite("volume", &GeometryResult::volume)
-        .def_readwrite("area", &GeometryResult::area)
-        .def_readwrite("fsc", &GeometryResult::fsc)
-        .def_readwrite("flags", &GeometryResult::flags);
+    m.doc() = "Geogram periodic power cell bridge with owned-copy + GIL-release pattern";
 
-    m.def("compute_power_cells", &compute_power_cells_hardened,
-          "Compute periodic power cells - HARDENED VERSION",
-          py::arg("points_norm"),
-          py::arg("weights"),
-          "Hardened implementation with:\n"
-          "- C++ owned memory (no dangling views)\n"
-          "- Input validation and sanitization\n"
-          "- Fresh Geogram objects every call\n"
-          "- Defensive extraction with exception guards\n"
-          "- Sanity checks on all outputs");
+    m.def("compute_power_cells",
+    [](py::array_t<double, py::array::c_style | py::array::forcecast> points,
+       py::array_t<double, py::array::c_style | py::array::forcecast> weights)
+    {
+        // STEP 1: Snapshot Python buffers into OWNED std::vectors
+        // This ensures data survives even if Python GC frees the original arrays
+        auto bp = points.request();
+        auto bw = weights.request();
+
+        // Validate input shapes
+        if (bp.ndim != 2 || bp.shape[1] != 3) {
+            throw std::runtime_error("points must be (N, 3)");
+        }
+        if (bw.ndim != 1) {
+            throw std::runtime_error("weights must be (N,)");
+        }
+        
+        const size_t N = static_cast<size_t>(bw.shape[0]);
+        if (bp.shape[0] != static_cast<ssize_t>(N)) {
+            throw std::runtime_error("points and weights size mismatch");
+        }
+
+        // Copy into OWNED vectors (no aliasing, no views)
+        std::vector<double> P(3 * N);
+        std::vector<double> W(N);
+        
+        const double* p_ptr = static_cast<const double*>(bp.ptr);
+        const double* w_ptr = static_cast<const double*>(bw.ptr);
+        
+        std::memcpy(P.data(), p_ptr, sizeof(double) * 3 * N);
+        std::memcpy(W.data(), w_ptr, sizeof(double) * N);
+
+        // STEP 2: Release GIL and run Geogram computation
+        // Python cannot interfere with our owned C++ memory during this
+        GeometryResult gr;
+        {
+            py::gil_scoped_release nogil;
+            gr = compute_power_cells_periodic_vec(P, W);
+        }
+        // GIL reacquired here automatically
+
+        // STEP 3: Return NEW NumPy arrays (owned copies, not views)
+        // This ensures Python owns its own memory, separate from std::vector
+        py::array_t<double> V_out(gr.volume.size());
+        std::memcpy(V_out.mutable_data(), gr.volume.data(),
+                    gr.volume.size() * sizeof(double));
+
+        py::array_t<double> A_out(gr.area.size());
+        std::memcpy(A_out.mutable_data(), gr.area.data(),
+                    gr.area.size() * sizeof(double));
+
+        py::array_t<int> FSC_out(gr.fsc.size());
+        std::memcpy(FSC_out.mutable_data(), gr.fsc.data(),
+                    gr.fsc.size() * sizeof(int));
+
+        py::array_t<int> FL_out(gr.flags.size());
+        std::memcpy(FL_out.mutable_data(), gr.flags.data(),
+                    gr.flags.size() * sizeof(int));
+
+        // Return as tuple: (volume, area, fsc, flags)
+        return py::make_tuple(V_out, A_out, FSC_out, FL_out);
+    },
+    py::arg("points"), py::arg("weights"),
+    R"doc(
+        Compute periodic power cells (Laguerre diagram) in [0,1]³.
+        
+        Args:
+            points: (N, 3) float64 array, positions in [0,1]³
+            weights: (N,) float64 array, weights (typically r²)
+        
+        Returns:
+            tuple: (volume, area, fsc, flags) all as NumPy arrays of size N
+                - volume: cell volumes
+                - area: cell surface areas
+                - fsc: face counts
+                - flags: 0=OK, >0=degenerate/error
+        
+        Implementation:
+            - Uses owned std::vector copies (no NumPy views)
+            - Releases GIL during Geogram computation
+            - Returns fresh NumPy arrays (no memory aliasing)
+            - SmartPointer<PeriodicDelaunay3d> per Bruno's guidance
+    )doc");
 }
-

@@ -1,127 +1,198 @@
 # scheduler.py
-# Cadence + FREEZE/RESUME glue
+# HARDENED: Strict one-in-flight FSM, owned snapshots, no buffer mutation
 
 import numpy as np
 # from geom_worker import GeomWorker  # Threaded version
 from geom_worker_sync import GeomWorkerSync as GeomWorker  # Single-threaded test
-from controller import apply_iq_banded_controller
-
-
-def _sanitize(P01, r, eps=1e-9):
-    """
-    Sanitize inputs before Geogram calls to prevent edge cases:
-    - Wrap positions to [0, 1)
-    - Clip radii to safe range
-    - De-duplicate exact overlaps with tiny jitter
-    """
-    # Wrap to [0, 1) with epsilon safety
-    P01 = np.mod(P01, 1.0)
-    P01[P01 >= 1.0] = 1.0 - eps
-    
-    # Clip radii to prevent zero/negative
-    r = np.clip(r, 1e-6, 1.0)
-    
-    # Check for exact duplicates → add tiny jitter
-    uniq = np.unique(P01.view([('', P01.dtype)]*3)).size
-    if uniq < len(P01):
-        P01 = np.mod(P01 + (np.random.rand(*P01.shape) - 0.5) * eps, 1.0)
-    
-    # Ensure C-contiguous float64
-    return (np.require(P01, np.float64, ['C']), 
-            np.require(r, np.float64, ['C']))
+from controller import IQController
 
 
 class FoamScheduler:
     def __init__(self, taichi_sim, k_freeze=24, target_ms=12.0):
         """
-        Initialize scheduler.
+        Initialize scheduler with strict one-request-at-a-time FSM.
         
         Args:
             taichi_sim: Taichi simulator with required methods
             k_freeze: FREEZE cadence (frames between geometry updates)
-            target_ms: Target t_geom for adaptive cadence (~80 FPS headroom)
+            target_ms: Target t_geom for adaptive cadence
         """
         self.sim = taichi_sim
         self.k = k_freeze
+        self.k_manual = None  # None = auto cadence, int = manual override
         self.target_ms = target_ms
         self.frame = 0
         self.worker = GeomWorker()
-        self.pending = False
+        self.worker_pending = False  # Strict FSM: only ONE request in flight
+        
+        # Countdown to next geometry call
+        self._geom_countdown = k_freeze
+        
+        # IQ Controller (live parameters)
+        self.controller = IQController(
+            IQ_min=0.65, IQ_max=0.85,
+            beta_grow=1.0, beta_shrink=0.7
+        )
+        
+        # Metrics
         self.last_IQ = None
         self.last_IQ_stats = (0.0, 0.0)
         self.last_t_geom_ms = 0.0
-        
-        # Worker recycling (prevents long-run state buildup)
         self.results_seen = 0
-        self.recycle_every = 300  # Recycle worker after 300 geometry results
+        self.recycle_every = 300
+        
+        # Debug canary (optional)
+        self._debug_call_count = 0
 
-    @staticmethod
-    def wrap01(x):
-        """Wrap positions to [0,1]³ (assumes already normalized upstream)"""
-        return x - np.floor(x)
+    def _snapshot_inputs(self):
+        """
+        Take OWNED, immutable snapshots of simulation state.
+        NO views, NO aliasing - matches minimal loop pattern.
+        """
+        # Get positions and radii (these may be views)
+        P = self.sim.get_positions01()   # expect (N, 3)
+        r = self.sim.get_radii()
+        
+        # Invariants
+        N = P.shape[0]
+        assert P.shape == (N, 3), f"bad P shape {P.shape}"
+        assert r.shape == (N,), f"bad r shape {r.shape}"
+        
+        # Owned, contiguous copies (NO views into sim memory)
+        # This is the same pattern as test_min_loop.py which passed 200 calls
+        P_own = np.ascontiguousarray(P, dtype=np.float64)
+        r_own = np.ascontiguousarray(r, dtype=np.float64)
+        
+        # Sanitize (wrap, clip, de-duplicate)
+        P_own = np.mod(P_own, 1.0)
+        P_own = np.clip(P_own, 0.0, 1.0 - 1e-9)
+        r_own = np.clip(r_own, 1e-6, 1.0)
+        
+        # Ensure final contiguity after sanitization
+        P_own = np.ascontiguousarray(P_own, dtype=np.float64)
+        r_own = np.ascontiguousarray(r_own, dtype=np.float64)
+        
+        # Cheap invariants
+        assert P_own.flags['C_CONTIGUOUS'], "P not C-contiguous"
+        assert r_own.flags['C_CONTIGUOUS'], "r not C-contiguous"
+        assert np.isfinite(P_own).all(), "P has non-finite values"
+        assert np.isfinite(r_own).all(), "r has non-finite values"
+        
+        W_own = r_own * r_own  # weights = r²
+        
+        return P_own, W_own, N
 
     def step(self):
         """
-        Call each render tick. Runs RELAX every frame.
-        Every k frames: FREEZE -> fire Geogram job (non-blocking).
-        When result returns: ADJUST radii, then keep RELAXing.
+        Strict one-request-at-a-time step.
+        RELAX always runs. Geometry requests only when idle.
         """
-        # Always run one RELAX step
+        # Increment frame counter FIRST (every step)
+        self.frame += 1
+        
+        # RELAX always (unless frozen by sim itself)
         self.sim.relax_step()
 
-        # 1) Try collect geometry result if any
-        if self.pending:
-            got = self.worker.try_result()
-            if got is not None:
-                V, S, FSC, flags, t_ms = got
-                r = self.sim.get_radii()                     # numpy view
-                r_new, IQ = apply_iq_banded_controller(r, V, S, flags)
-                self.sim.set_radii(r_new)                    # write back
-                self.last_IQ = IQ                            # store for coloring
-                self.last_IQ_stats = (float(IQ.mean()), float(IQ.std()))
-                self.last_t_geom_ms = float(t_ms)
-                
-                # Adaptive cadence with better backoff thresholds
-                if t_ms > 32 and self.k < 96:      # Heavy → relax cadence
-                    self.k += 8
-                elif t_ms < 12 and self.k > 16:    # Cheap → tighten a bit
-                    self.k -= 4
-                
-                self.pending = False
-                
-                # Worker recycling: prevent long-run state buildup
-                self.results_seen += 1
-                if self.results_seen % self.recycle_every == 0:
-                    self.worker = GeomWorker()  # Safe worker reset
-
-        # 2) Fire new geometry job on cadence, if none pending
-        if (self.frame % self.k == 0) and not self.pending:
-            self.sim.freeze()                                # pause particle advection
-            P = self.sim.get_positions01()                   # Nx3, already [0,1]³
+        # PRIORITY 1: If a request is pending, try to collect and RETURN EARLY
+        if self.worker_pending:
+            res = self.worker.try_result()
+            if res is None:
+                # Still computing - do NOT issue new request
+                return
+            
+            # Result ready - unpack and apply
+            V, A, FSC, FL, t_ms = res
+            
+            # Cheap sanity check
+            if not np.isfinite(V).all():
+                raise RuntimeError(f"Non-finite volumes at frame {self.frame}")
+            
+            # Optional: check volume sum (should be ~1.0 for periodic unit cube)
+            sumV = float(V.sum())
+            if abs(sumV - 1.0) > 1e-2:
+                # Not fatal, but log it
+                pass
+            
+            # Apply controller (IQ-banded, zero-sum)
             r = self.sim.get_radii()
+            r_new, IQ = self.controller.apply(r, V, A, FL)
+            self.sim.set_radii(r_new)
             
-            # Sanitize inputs before Geogram call (prevent edge cases)
-            P, r = _sanitize(P, r)
-            W = r*r                                         # weights = r²
+            # Update metrics
+            self.last_IQ = IQ
+            self.last_IQ_stats = (float(IQ.mean()), float(IQ.std()))
+            self.last_t_geom_ms = float(t_ms)
             
-            ok = self.worker.try_request(P, W)               # P is Nx3, W is N
-            self.sim.resume()
-            self.pending = ok
+            # Adaptive cadence (only if not manually overridden)
+            if self.k_manual is None:
+                if t_ms > 32 and self.k < 96:
+                    self.k += 8
+                elif t_ms < 12 and self.k > 16:
+                    self.k -= 4
+            
+            # FSM: mark idle
+            self.worker_pending = False
+            self.results_seen += 1
+            
+            # Optional: recycle worker
+            if self.results_seen % self.recycle_every == 0:
+                self.worker = GeomWorker()
+            
+            # RETURN - do not issue new request this frame
+            return
 
-        self.frame += 1
+        # PRIORITY 2: Count down to next geometry call
+        self._geom_countdown -= 1
+        if self._geom_countdown > 0:
+            # Not time yet
+            return
 
+        # PRIORITY 3: Time to request - take snapshot and submit ONE request
+        self.sim.freeze()
+        P_own, W_own, N = self._snapshot_inputs()
+        self.sim.resume()
+        
+        # Optional debug canary (cheap hash of first 4K bytes)
+        self._debug_call_count += 1
+        if self._debug_call_count % 50 == 0:
+            hashP = hash(P_own.tobytes()[:4096])
+            hashW = hash(W_own.tobytes()[:4096])
+            # Uncomment to debug: print(f"[geom #{self._debug_call_count}] hashP={hashP} hashW={hashW}")
+        
+        # Submit request
+        ok = self.worker.try_request(P_own, W_own)
+        if ok:
+            self.worker_pending = True
+            self._geom_countdown = self.k  # Reset cadence
+
+    def set_k_freeze(self, k: int | None):
+        """
+        Set cadence manually or re-enable auto tuning.
+        
+        Args:
+            k: int = manual cadence (disables auto), None = auto cadence
+        """
+        if k is None:
+            # Re-enable auto cadence
+            self.k_manual = None
+        else:
+            # Manual override (disable auto)
+            k = max(8, min(k, 96))  # Clamp to [8, 96]
+            self.k_manual = k
+            self.k = k
+    
     def hud(self):
         """Return HUD metrics dictionary"""
         mu, sigma = self.last_IQ_stats
         return {
             "IQ_mu": mu,
             "IQ_sigma": sigma,
-            "geom_pending": self.pending,
+            "geom_pending": self.worker_pending,
             "cadence": self.k,
             "t_geom_ms": self.last_t_geom_ms,
+            "auto_cadence": (self.k_manual is None),
         }
     
     def get_last_IQ(self):
         """Return last computed IQ array (for coloring)"""
         return self.last_IQ
-

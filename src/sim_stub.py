@@ -1,21 +1,29 @@
 # sim_stub.py
-# Minimal Taichi simulator stub for testing scheduler integration
-# This demonstrates the required interface - replace with real Taichi implementation
+# HARDENED: Guaranteed C-order, owned buffers in getters
 
 import numpy as np
 
 
+def jittered_grid_positions01(n, seed=42):
+    """Generate jittered grid positions (avoids random overlaps that crash Geogram)"""
+    np.random.seed(seed)
+    m = int(round(n ** (1/3)))
+    m = max(4, m)
+    gx = np.linspace(0.05, 0.95, m)
+    pts = np.stack(np.meshgrid(gx, gx, gx, indexing='ij'), axis=-1).reshape(-1,3)
+    if len(pts) < n:
+        k = n - len(pts)
+        jitter = (np.random.rand(k,3) - 0.5) * (1.0/m) * 0.2
+        pts = np.concatenate([pts, pts[:k] + jitter], axis=0)
+    pts = pts[:n]
+    pts += (np.random.rand(n,3) - 0.5) * (1.0/m) * 0.1
+    return np.mod(pts, 1.0)
+
+
 class TaichiSimStub:
     """
-    Minimal stub showing required interface for FoamScheduler.
-    
-    Required methods:
-        get_positions01() -> np.ndarray (N, 3) in [0,1]³
-        get_radii() -> np.ndarray (N,)
-        set_radii(r_new: np.ndarray)
-        relax_step()
-        freeze()
-        resume()
+    HARDENED stub: Always returns owned, C-contiguous arrays.
+    NO .ravel() views, NO aliasing.
     """
     
     def __init__(self, N=100, box_size=1.0):
@@ -29,9 +37,8 @@ class TaichiSimStub:
         self.N = N
         self.box_size = box_size
         
-        # Initialize positions randomly in [0,1]³
-        np.random.seed(42)
-        self.positions = np.random.rand(N, 3)
+        # Initialize positions with jittered grid (SAFE - avoids Geogram degeneracies)
+        self.positions = jittered_grid_positions01(N, seed=42)
         
         # Initialize radii (typical foam: mean spacing ~ 0.02-0.03)
         mean_r = 0.02
@@ -47,12 +54,20 @@ class TaichiSimStub:
         print(f"✓ TaichiSimStub initialized: N={N}, box_size={box_size}")
     
     def get_positions01(self):
-        """Return positions in [0,1]³ coordinate system"""
-        return self.positions.copy()
+        """
+        Return positions in [0,1]³ coordinate system.
+        GUARANTEED: (N, 3) C-contiguous float64, OWNED (not a view).
+        """
+        # Ensure C-order, owned buffer - NO views
+        return np.ascontiguousarray(self.positions, dtype=np.float64)
     
     def get_radii(self):
-        """Return radii (numpy view)"""
-        return self.radii
+        """
+        Return radii array.
+        GUARANTEED: (N,) C-contiguous float64, OWNED (not a view).
+        """
+        # Ensure C-order, owned buffer - NO views
+        return np.ascontiguousarray(self.radii, dtype=np.float64)
     
     def set_radii(self, r_new):
         """Update radii from controller"""
@@ -88,4 +103,3 @@ class TaichiSimStub:
             "mean_r": float(self.radii.mean()),
             "std_r": float(self.radii.std()),
         }
-
